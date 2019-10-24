@@ -2,7 +2,6 @@
 ; lab_1_task2.asm
 ;
 ; Author: Christopher Shu Chun Lam, Qingsong Sun
-; zID: z3460499, z5222508
 ; Created: 26/09/2019
 ; Last Modified: 03/10/2019
 ; Version: 3.0.0

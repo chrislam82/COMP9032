@@ -2,7 +2,6 @@
 ; lab_1_task1.asm
 ;
 ; Author: Christopher Shu Chun Lam
-; zID: z3460499
 ; Created: 25/09/2019
 ; Last Modified: 26/09/2019
 ; Version: 1.1.0
