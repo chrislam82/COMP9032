@@ -1,0 +1,409 @@
+; project_main
+; version: 3.0.0
+
+.include "m2560def.inc"
+.include "leds.inc"
+
+; Prescaler set to /1024
+; Time/interrupt = 256 * 1024 / 16_000_000 = 0.016384 sec/overflowInterrupt
+; Number of interrupts required = 0.5sec / 0.016384 ~= 30.52 = 31 (rounded up)
+.equ overflowIntLoopCount = 31
+
+; 4 for keypad
+.def col = r16                          ; Store current row/column being checked (Col is more optional, only 2 columns to check, could be replaced to free a register)
+.def row = r17
+.def cMask = r18                        ; Row/column masks
+.def rMask = r19
+
+;3 temp values
+.def temp0=r23
+.def temp1=r24
+.def temp2=r25
+
+;;;;;;;;; LCD setup ;;;;;;;;; 
+.equ LCD_RS = 7
+.equ LCD_E = 6
+.equ LCD_RW = 5
+.equ LCD_BF = 7
+
+;;;;;;;;; LCD DDRAM Addresses ;;;;;;;;;
+	; Used for changing current address in DDRAM
+	; Address = Address in 2 line DDRAM + 0b_1000_000(128) to specify DDRAM
+.equ LCDaddressState=128
+.equ LCDaddressW1=172
+.equ LCDaddressW2=175
+.equ LCDaddressW3=178
+.equ LCDaddressW4=181
+
+; 2 Control registers
+.def windowControl=r20
+.def centralControl=r21
+
+.equ win1_dir=0
+.equ win1_req=1
+.equ win2_dir=2
+.equ win2_req=3
+.equ win3_dir=4
+.equ win3_req=5
+.equ win4_dir=6
+.equ win4_req=7
+
+.equ central_dir=0
+.equ central_req=1
+.equ emergency_req=2
+.equ win1_changing=4
+.equ win2_changing=5
+.equ win3_changing=6
+.equ win4_changing=7
+    ; (...)_req   --> (1) specifies that direction in dir is currently requested. (0) indicates there is no current request for a change in level
+    ; (...)_dir   --> (1) specifies a request to inc opaqueness. (0) specifies a request to dec opaqueness. req must be set to (1) for a dir change to be executed
+	; (...)_changing --> (1) specifies that a window is currently changing levels. (0) specifies that a window is stable and ready for accepting/processing requests
+        ; changing, req and dir work together to store requests and for processing later
+
+.dseg
+.org 0x0200
+    ; (...)_level --> specifies the current state/opaqueness level(0-3) of a given window
+    ; timerCount --> For counting number of TimerOverflowInterrupts called
+	;				 Used to determine how long a window has spent transitioning
+	win1_level:		.byte 1
+	win2_level:		.byte 1
+	win3_level:		.byte 1
+	win4_level:		.byte 1
+
+	win1_timerCount:.byte 1
+	win2_timerCount:.byte 1
+	win3_timerCount:.byte 1
+	win4_timerCount:.byte 1
+
+.cseg
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; Macros ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; LCD MACROS ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+ 
+.macro do_lcd_command                   ; write a command to LCD instruction memory
+    ldi temp1, @0
+    rcall lcd_command
+    rcall lcd_wait
+.endmacro
+ 
+.macro do_lcd_data                      ; write data to LCD data memory from register being passed in
+    ldi temp1, @0
+    rcall lcd_data
+    rcall lcd_wait
+.endmacro
+
+.macro do_lcd_data_reg                      ; write data to LCD data memory from register being passed in
+    mov temp1, @0
+    rcall lcd_data
+    rcall lcd_wait
+.endmacro
+ 
+.macro lcd_set
+    sbi PORTA, @0
+.endmacro
+ 
+.macro lcd_clr
+    cbi PORTA, @0
+.endmacro
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; IVT INIT ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; IVT ordered based on order in m2560def.inc
+.cseg
+.org 0x0000							; addr for RESET
+	jmp RESET
+.org INT0addr						; addr for External Interrupt Request0
+	jmp emergency
+.org OVF0addr						; addr for timerOverflowInterrupts0
+	jmp central_timer
+DEFAULT: reti
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; Interrupts ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+RESET:
+	; Setup all timerOverflowInterrupts
+	clr temp1
+	out TCCR0A, temp1
+	ldi temp1, (1<<CS00) | (1<<CS02)		; Scale counter by /1024
+	out TCCR0B, temp1
+	ldi temp1, 1<<TOIE0						; Activate Overflow Timer
+	sts TIMSK0, temp1
+	sei										; enable I (Interrupts) in SREG
+
+	;;;;;;;;;;;;; LCD_INIT
+    ldi temp1, low(RAMEND)              ; To setup the stack
+    out SPL, temp1
+    ldi temp1, high(RAMEND)             ; But should be setup automatically in ATmega2560
+    out SPH, temp1
+ 
+    ser temp1
+    out DDRC, temp1                     ; Setup portC for LCD data (output)
+    out DDRA, temp1                     ; Setup portA for controlling LCD
+    clr temp1
+    out PORTC, temp1                    ; Clear ports
+    out PORTA, temp1
+ 
+    do_lcd_command 0b00111000           ; 2x5x7
+    ldi temp2, 5                        ; delay for 5ms
+    rcall delay
+    do_lcd_command 0b00111000           ; 2x5x7
+    rcall sleep_1ms
+    do_lcd_command 0b00111000           ; 2x5x7
+    do_lcd_command 0b00111000           ; 2x5x7
+    do_lcd_command 0b00001000           ; display off
+    do_lcd_command 0b00000001           ; clear display
+    do_lcd_command 0b00000110           ; increment, no display shift
+    do_lcd_command 0b00001110           ; Cursor on, bar, no blink
+
+	;;;;; LCD INIT STATE
+    do_lcd_data 'S'
+    do_lcd_data ':'
+    do_lcd_data ' '
+    do_lcd_data 'W'
+    do_lcd_data '1'
+    do_lcd_data ' '
+    do_lcd_data 'W'
+    do_lcd_data '2'
+    do_lcd_data ' '
+    do_lcd_data 'W'
+    do_lcd_data '3'
+    do_lcd_data ' '
+    do_lcd_data 'W'
+    do_lcd_data '4'
+    do_lcd_data ' '
+    do_lcd_command LCDaddressW1 ; Set to 2nd line of LCD start
+    do_lcd_data '0'
+    do_lcd_data ' '
+    do_lcd_data ' '
+    do_lcd_data '0'
+    do_lcd_data ' '
+    do_lcd_data ' '
+    do_lcd_data '0'
+    do_lcd_data ' '
+    do_lcd_data ' '
+    do_lcd_data '0'
+
+	; Initialise LEDs
+	init_LEDs
+
+	jmp main
+
+; External Interrupt Request 0 (For Emergency (PB0))
+emergency:
+	;in temp0, SREG							; Necessary if anything in here affects SREG (Carry, Neg, V, Z, ...)
+	;push temp0
+	push temp1
+	push temp2
+	sbr centralControl, (1<<emergency_req)	; Activate emergency_req bit in central Control register
+	; Then write new state to LCD
+	pop temp2
+	pop temp1
+	;pop temp0
+	;out SREG, temp0
+	reti
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;; Window1_Transition : TimerOverflowInterrupt0 ;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+central_timer:
+	in temp0, SREG							; Necessary if anything in here affects SREG (Carry, Neg, V, Z, ...)
+	push temp0
+	push temp1
+	push temp2
+win1_check:
+	sbrs windowControl, win1_req
+	rjmp win2_check
+
+	lds temp1, win1_timerCount
+	inc temp1								; Check if overflowIntLoopCount (31) interrupts have occurred
+	cpi temp1, overflowIntLoopCount							; If not, 0.5sec has not passed so window still transitioning levels
+	brne win1_end
+win1_halfSecond:							; passed 0.5sec transition
+	sbrs windowControl, win1_dir
+	rjmp win1_dec
+win1_inc:
+	lds temp2, win1_level
+	inc temp2								; Increase level and store new level in dseg
+	sts win1_level, temp2
+	subi temp2, -'0'
+	do_lcd_command LCDaddressW1				; Increase win1 level on LCD
+	do_lcd_data_reg temp2
+	inc_Win1_led							; Increase win1 level on LED
+	rjmp win1_resetTimer
+win1_dec:
+	lds temp2, win1_level
+	dec temp2								; Increase level and store new level in dseg
+	sts win1_level, temp2
+	subi temp2, -'0'
+	do_lcd_command LCDaddressW1				; Increase win1 level on LCD
+	do_lcd_data_reg temp2
+	dec_Win1_led							; Increase win1 level on LED
+win1_resetTimer:
+	cbr windowControl, (1<<win1_req)			; set win1_req bit to 0 (request fulfilled)
+	clr temp1								; Turn off timer and clear overflowCount
+
+win1_end
+
+win2_check:
+
+
+win1_end:
+	sts win1_timerCount, temp1
+	pop temp2
+	pop temp1
+	pop temp0
+	out SREG, temp0
+	reti
+
+
+
+
+
+
+
+
+
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; MAIN ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+main:
+	ldi windowControl, 0b_0000_1111
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+
+	ldi windowControl, 0b_0000_1111
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+
+	ldi windowControl, 0b_0000_1111
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+
+	ldi windowControl, 0b_0000_1010
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+
+	ldi windowControl, 0b_0000_1010
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+
+	ldi windowControl, 0b_0000_1010
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+	ldi temp2, 250
+	rcall delay
+
+end:
+	rjmp end
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; END OF MAIN ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; FUNCTIONS ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+ 
+;;;;;;;;;; Function call. Send Instruction/Data to LCD ;;;;;;;;;;
+ 
+lcd_command:
+    out PORTC, temp1
+    nop
+    lcd_set LCD_E
+    nop
+    nop
+    nop
+    lcd_clr LCD_E
+    nop
+    nop
+    nop
+    ret
+ 
+lcd_data:
+    out PORTC, temp1
+    lcd_set LCD_RS                      ; Set LCD to data register
+    nop
+    nop
+    nop
+    lcd_set LCD_E
+    nop
+    nop
+    nop
+    lcd_clr LCD_E
+    nop
+    nop
+    nop
+    lcd_clr LCD_RS                      ; set back to instruction register
+    ret
+ 
+;;;;;;;;;; Function call. Check BF until LCD ready ;;;;;;;;;;
+ 
+lcd_wait:                               ; function call. check busy flag until LCD ready
+    push temp1
+    clr temp1
+    out DDRC, temp1                     ; make portC input port
+    out PORTC, temp1                    ; activate pullup
+    lcd_set LCD_RW                      ; set to read(1) from LCD
+lcd_wait_loop:
+    nop
+    lcd_set LCD_E                       ; turn on enable pin
+    nop
+    nop
+    nop
+    in temp1, PINC                      ; read from pinC and see if BF is set(busy)
+    lcd_clr LCD_E
+    sbrc temp1, LCD_BF                  ; keep checking until no longer busy
+    rjmp lcd_wait_loop
+    lcd_clr LCD_RW                      ; Set LCD back to write(0)
+    ser temp1
+    out DDRC, temp1                     ; set portF back to output port
+    pop temp1                           ; end function call
+    ret
+
+;;;;;;;;;; Delay Function Calls ;;;;;;;;;;
+ 
+.equ F_CPU = 16000000
+.equ DELAY_1MS = F_CPU / 4 / 1000 - 4
+; 4 cycles per iteration - setup/call-return overhead
+ 
+sleep_1ms:                              ; close enough to 1ms
+    push temp1                          ; 4 cycless
+    push temp2
+    ldi temp2, high(DELAY_1MS)          ; 2 cycles
+    ldi temp1, low(DELAY_1MS)
+delayloop_1ms:
+    sbiw temp2:temp1, 1                 ; 4 standard. 3 last
+    brne delayloop_1ms
+    pop temp2                           ; 4 cycles
+    pop temp1
+    ret                                 ; 4 cycles
+ 
+delay:
+    rcall sleep_1ms
+    subi temp2, 1
+    brne delay
+    ret
