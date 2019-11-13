@@ -1,8 +1,9 @@
 ; lab_4.asm
 ;
+; Name: Christopher Lam
 ; Created: 12.11.2019
 ; Last modified: 12.11.2019
-; Version: 1.3.
+; Version: 1.3.1
 ;
 ; File:
 ;		Loads measured rps to LCD screen and is updated every 1 second
