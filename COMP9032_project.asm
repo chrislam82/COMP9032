@@ -735,7 +735,7 @@ delay:
     rcall sleep_1ms
     subi temp2, 1							; Dec temp2 for each loop
     brne delay								; Calls sleep_1ms until temp2==0
-    ret										; Returns with temp0=0
+    ret										; Returns with temp2=0
 
 
 
